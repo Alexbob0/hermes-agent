@@ -266,6 +266,7 @@ Returns a machine-readable description of the API server's stable surface for ex
     "run_status": true,
     "run_events_sse": true,
     "run_stop": true,
+    "run_clarify": true,
     "reasoning_streaming": true
   }
 }
@@ -564,6 +565,45 @@ Resolve a pending approval for a run that is waiting on a human decision (for ex
 
 MCP trust-gate consent — a write-capable tool on a server configured `trust: untrusted` — surfaces the same way: the run emits an `approval.request` event and parks in `waiting_for_approval` until this endpoint resolves it (`once` runs the tool, `deny` blocks it).
 
+### POST /v1/runs/\{run_id\}/clarify
+
+Answer or dismiss the questions the agent asked with the `clarify` tool. Enable the tool for the API server with `platform_toolsets.api_server` (it is not in the default `hermes-api-server` toolset). Support is advertised as `features.run_clarify: true` in `/v1/capabilities`; older servers answer the tool with "not available in this execution context".
+
+When the agent asks, the run emits `clarify.request`, its status becomes `waiting_for_input`, and `GET /v1/runs/{run_id}` carries the same event under `clarify`:
+
+```json
+{
+  "event": "clarify.request",
+  "run_id": "run_abc123",
+  "timestamp": 1760000000.0,
+  "type": "clarify.request",
+  "request_id": "clr_3f2a9c1b7d0e",
+  "questions": [
+    {"id": "q0", "question": "Which environment?", "choices": ["staging", "prod"], "multi_select": false, "allow_other": true},
+    {"id": "q1", "question": "Anything else?", "choices": [], "multi_select": false, "allow_other": true}
+  ]
+}
+```
+
+One `clarify` call may ask up to five questions; they share one `request_id`. `choices` are bare labels in the agent's order (the first is its recommendation); `allow_other: true` means free text is accepted too. Question text and choices pass forced secret redaction before they leave the process.
+
+Answer every question, keyed by its `id`. A string is the answer, an array of strings answers a `multi_select` question, and `null` (or an empty string) skips that question:
+
+```json
+{"request_id": "clr_3f2a9c1b7d0e", "answers": {"q0": "prod", "q1": null}}
+```
+
+Dismiss the whole request without answering with `{"request_id": "...", "cancel": true}`. `request_id` may be omitted while the run has exactly one request pending.
+
+| Response | When |
+|---|---|
+| `200` `{"object": "hermes.run.clarify_response", "run_id", "request_id", "resolved", "answers"}` (or `"cancelled": true` instead of `answers`) | The answer or dismissal was handed to the agent |
+| `400 invalid_clarify_answers` / `400 clarify_answers_incomplete` | No `answers` object and no `cancel`, or a question `id` missing from `answers` |
+| `404 clarify_not_pending` | The run has no such pending request |
+| `409 clarify_already_resolved` | The request was already answered, dismissed, stopped or timed out |
+
+The run then emits `clarify.responded` (`request_id`, `answers`) and returns to `running`. A question that ends without an answer emits `clarify.cancelled` with `request_id` and a `reason`: `cancelled` (dismissed through this endpoint), `stopped` (`POST /v1/runs/{run_id}/stop`), or `timeout` (no answer within `agent.clarify_timeout`, default one hour). The agent receives the same outcome in the tool result and continues its turn. Runs dispatched through a hosted room do not get the `clarify` tool.
+
 ## Jobs API (background scheduled work)
 
 The server exposes a lightweight jobs CRUD surface for managing scheduled / background agent runs from a remote client. All endpoints are gated behind the same bearer auth.
@@ -694,7 +734,7 @@ to the routed profile**:
 - A named profile with no `API_SERVER_KEY` of its own fails closed — its
   prefix is unreachable until you set one.
 - Runs are per-profile scoped: `/v1/runs/{run_id}` and its `events`, `stop`,
-  `steer`, and `approval` routes only answer for the profile that created
+  `steer`, `approval`, and `clarify` routes only answer for the profile that created
   the run (including runs started via `/api/sessions/{id}/chat/stream`);
   another profile's run id returns `404`, never `403`.
 
